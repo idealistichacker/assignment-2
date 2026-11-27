@@ -1,0 +1,156 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+
+\title{11-768 HW2: Evaluating a Data-Visualization Agent}
+\author{Your Name}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Part 1: Examine Seed Agent Runs}
+
+\subsection{Comparison of Ground-Truth and Validator Labels}
+We evaluated the baseline validator (\texttt{validator/baseline.py}) across all 110 seed runs in \texttt{artifacts/} against the human ground-truth annotations in \texttt{seed\_labels.json}. Table~\ref{tab:part1-baseline} summarizes the per-family Matthews Correlation Coefficient (MCC), confusion counts, and positive/negative support for each error category.
+
+\begin{table}[h]
+\centering
+\caption{Baseline validator performance on the 110 seed runs (\texttt{output/baseline\_predictions.json} vs.\ \texttt{seed\_labels.json}).}
+\label{tab:part1-baseline}
+\begin{tabular}{lrrrrrr}
+\toprule
+Error Family & MCC & TP & TN & FP & FN & Support ($+$/$-$) \\
+\midrule
+\texttt{execution\_failure} & $-0.0022$ & 4 & 65 & 33 & 8 & 12 / 98 \\
+\texttt{wrong\_data}        & $0.0000$  & 0 & 73 & 0  & 25 & 25 / 73 \\
+\texttt{wrong\_chart}       & $0.1096$  & 3 & 27 & 0  & 68 & 71 / 27 \\
+\texttt{hard\_to\_read}     & $0.0000$  & 0 & 59 & 0  & 39 & 39 / 59 \\
+\midrule
+\textbf{Macro-MCC}          & \textbf{0.0268} & --- & --- & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Overall agreement is near zero ($\text{macro-MCC} = 0.0268$), and disagreements concentrate in two sharply distinct regimes:
+\begin{enumerate}
+    \item \textbf{Bidirectional failure and cascading short-circuiting on \texttt{execution\_failure}:} Out of 12 true \texttt{execution\_failure} runs, the baseline detects only 4 (8 false negatives), while falsely flagging 33 valid runs as \texttt{execution\_failure} (33 false positives), yielding a slightly negative MCC ($-0.0022$). Because \texttt{validate()} returns immediately whenever \texttt{judge\_execution()} is non-empty, those 33 false positives also bypass \texttt{judge\_data\_and\_chart()} and \texttt{judge\_readability()}, automatically causing 3 \texttt{wrong\_data}, 14 \texttt{wrong\_chart}, and 8 \texttt{hard\_to\_read} ground-truth errors to be missed.
+    \item \textbf{Extreme false-negative skew on content, design, and readability:} Even among the 65 valid runs that pass \texttt{judge\_execution()} and reach the remaining three checks, the baseline exhibits near-total recall collapse with zero false positives: it catches $0/22$ \texttt{wrong\_data} errors, $3/57$ \texttt{wrong\_chart} errors (runs \texttt{059}, \texttt{087}, and \texttt{173}), and $0/31$ \texttt{hard\_to\_read} errors, driving \texttt{wrong\_data} and \texttt{hard\_to\_read} MCCs to exactly $0.0000$.
+\end{enumerate}
+
+\subsection{Validator Error Type 1: Unreliable VLM \texttt{execution\_failure} Judgment and Cascading Short-Circuiting}
+The baseline delegates \texttt{execution\_failure} entirely to the VLM via a negative-polarity question---\textit{``Did the agent crash, exhaust its turns, or give up without producing a valid figure?''}---and classifies a run as \texttt{execution\_failure} whenever the response begins with \texttt{"YES"} (\texttt{answer.upper().startswith("YES")}). In addition, \texttt{\_ask()} never inspects local disk state: when \texttt{run.figure} is \texttt{None}, it silently omits the image attachment without informing the model. This design causes both massive false positives and missed true failures:
+
+\begin{itemize}
+    \item \textbf{False-positive polarity inversion (33 of 33 FPs):} In every single one of the 33 false-positive \texttt{execution\_failure} predictions, the model's own generated \texttt{evidence} explicitly states that the agent \emph{succeeded} and produced a valid figure, yet the model opened its reply with \texttt{"YES"} (answering as if asked whether the task succeeded). Because \texttt{baseline.py} only checks the leading \texttt{"YES"} prefix and short-circuits, all subsequent error checks are skipped.
+    \begin{itemize}
+        \item \textbf{Run \texttt{004}:} In \texttt{artifacts/004/result.json}, \texttt{visualize\_functions.py} exited with \texttt{returncode: 0}, produced a $137{,}276$-byte 2$\times$2 \texttt{figure.png}, and exited with \texttt{exit\_status: "Submitted"}. Ground truth labels \texttt{004} as \texttt{wrong\_data} (panel 4 computes \texttt{y4 = 15 ** x4} without cubing) and \texttt{wrong\_chart} (panel 4 leaves the x-axis linear instead of logarithmic). However, the baseline returned \texttt{execution\_failure} with evidence: \textit{``The agent successfully completed the task... resulting figure.png file was created and verified to be valid... There were no crashes, turn exhaustion, or premature abandonment.''}, thereby missing both real errors.
+        \item \textbf{Run \texttt{022}:} The agent wrote and ran \texttt{create\_figure.py}, producing a valid $42{,}528$-byte 1$\times$2 linear/log subplot \texttt{figure.png} and submitting cleanly. Yet the baseline again emitted \texttt{execution\_failure} while its evidence read: \textit{``The agent successfully completed the task. It created a Python script using matplotlib to generate a figure with two side-by-side subplots...''}.
+    \end{itemize}
+    \item \textbf{Missing-artifact blindness (8 of 12 FNs):} Across all 110 seed runs, all 12 ground-truth \texttt{execution\_failure} runs have no \texttt{figure.png} on disk (\texttt{run.figure is None}), whereas all 98 non-\texttt{execution\_failure} runs have a valid Pillow-decodable \texttt{figure.png}. Because \texttt{baseline.py} does not check \texttt{run.figure is None} or tell the VLM that the image is absent, the VLM frequently hallucinates success from trajectory text alone.
+    \begin{itemize}
+        \item \textbf{Run \texttt{010}:} The agent looped for 23 bash commands (repeatedly activating a virtualenv and failing to produce a figure) until hitting \texttt{exit\_status: "LimitsExceeded"}, leaving no \texttt{figure.png}. The baseline predicted \texttt{[]} (no errors).
+        \item \textbf{Run \texttt{096}:} The agent's \texttt{plot.py} saved to the wrong filename (\texttt{'create figure.png'}) rather than \texttt{figure.png}, so \texttt{run.figure} is \texttt{None} at evaluation time. Instead of reporting \texttt{execution\_failure}, the baseline missed it and paradoxically predicted \texttt{wrong\_chart}.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Validator Error Type 2: Systematic False Negatives from Raw Trajectory Noise and Unstructured Single-Shot Prompts}
+Among the 65 valid runs that actually reached \texttt{judge\_data\_and\_chart()} and \texttt{judge\_readability()}, the baseline missed 107 out of 110 ground-truth error instances (22/22 \texttt{wrong\_data}, 54/57 \texttt{wrong\_chart}, and 31/31 \texttt{hard\_to\_read}). Two structural flaws in \texttt{validator/baseline.py} explain this conservatism:
+\begin{enumerate}
+    \item \textbf{Raw, noisy trajectory serialization:} \texttt{\_ask()} dumps \texttt{str(run.messages)} verbatim (median $16{,}547$ characters, up to $79{,}883$ characters), burying the final executed plotting script inside escaped JSON strings, shell tracebacks, tool-call IDs, and superseded earlier scripts that often look correct in parts where the final \texttt{plot.py} regressed.
+    \item \textbf{Vague single-sentence \texttt{YES/NO} prompts without rubric or reasoning-before-verdict:} Each check asks a single broad question (e.g., \textit{``Does the plotted data differ from what was requested in any way?''} or \textit{``Is the rendered figure difficult or impossible to read?''}) with no definition of what counts under \texttt{wrong\_data}, \texttt{wrong\_chart}, or \texttt{hard\_to\_read}, and forces the model to output \texttt{YES} or \texttt{NO} as its very first token before inspecting individual requirements. When confronted with a dense multi-thousand-token blob and an underspecified question, the 30B VLM overwhelmingly defaults to \texttt{NO}.
+\end{enumerate}
+
+Four representative runs that passed \texttt{judge\_execution()} yet received \texttt{[]} (all errors missed) illustrate this failure across all three downstream families:
+\begin{itemize}
+    \item \textbf{Run \texttt{008} (GT: \texttt{wrong\_data}, \texttt{hard\_to\_read}; Pred: \texttt{[]}):} In the final executed \texttt{plot.py} (message 14), the agent explicitly filtered out \texttt{orange} from sources via \texttt{.query("source != 'orange'")}, dropping the entire \texttt{orange} source node present in \texttt{data.csv} (even though an earlier unused draft \texttt{create\_sankey.py} in the same trajectory had included all labels). It also rendered every node value label in near-white \texttt{color="\#f4f4f4"} on a white canvas, making the labels virtually invisible in \texttt{figure.png}. The baseline missed both defects.
+    \item \textbf{Run \texttt{009} (GT: \texttt{wrong\_chart}, \texttt{hard\_to\_read}; Pred: \texttt{[]}):} The instructions explicitly require \textit{``Rotate the x tick labels by 30 degrees''}. However, the final \texttt{plot.py} sets \texttt{mdates.MonthLocator(interval=1)} with \texttt{rotation=0}, producing an illegible horizontal black smear of overlapping date labels along the bottom axis of \texttt{figure.png}. Both the code violation and visual overlap were missed.
+    \item \textbf{Run \texttt{013} (GT: \texttt{wrong\_chart}; Pred: \texttt{[]}):} The requirements explicitly state \textit{``do NOT use the jet, rainbow or hsv colormaps''} and \textit{``Set the x axis limits to 0..20''}. The final \texttt{plot.py} literally calls \texttt{plt.colormaps["rainbow"]} and \texttt{ax.set\_xlim(-5, 25)}, both plainly visible in the script and the 3D plot, yet the baseline answered \texttt{NO}.
+    \item \textbf{Run \texttt{016} (GT: \texttt{wrong\_data}, \texttt{wrong\_chart}; Pred: \texttt{[]}):} The task requires dropping browser versions below $0.5\%$ share and showing a browser legend. An earlier failing draft (\texttt{create\_chart.py}) contained \texttt{df[df['Data'] >= 0.5]}, whereas the final executed \texttt{plot.py} omitted the filter (plotting IE~9.0 at $0.44\%$, UC Browser~7.0 at $0.36\%$, and Chrome~65.0 at $0.25\%$) and omitted \texttt{ax.legend()}. Because the raw trajectory mixed the superseded draft with the final script under a vague prompt, the baseline failed to catch either error.
+\end{itemize}
+
+\subsection{Proposed Validator Changes}
+To address both failure modes in Part~2 without hard-coding task IDs or replacing the fixed validator model, we propose two targeted, generalizable changes in \texttt{validator/solution.py}:
+
+\begin{enumerate}
+    \item \textbf{Change 1 (Deterministic \texttt{execution\_failure} Verification):} Replace the polarity-prone VLM prompt in \texttt{judge\_execution(run)} with deterministic local Python and Pillow checks. Specifically, verify that \texttt{run.figure} exists, has non-zero byte size, decodes cleanly as an image via \texttt{PIL.Image}, has non-degenerate pixel dimensions, and contains non-uniform pixel content (not a blank/single-color canvas). This eliminates both missing-figure false negatives (e.g., runs \texttt{010}, \texttt{096}) and false-positive short-circuiting on valid runs (e.g., runs \texttt{004}, \texttt{022}) at zero VLM cost.
+    \item \textbf{Change 2 (Structured Trajectory Extraction + Rubric-Guided Analyze-Then-Verdict Prompting):}
+    \begin{itemize}
+        \item \emph{Structured input curation:} Parse \texttt{run.messages} to separate the final executed plotting script (and its terminal output/exit status) from superseded earlier drafts, and attach deterministic image metadata (canvas pixel size and DPI from Pillow) alongside bounded input-data previews. Place the shared run context before per-category audit instructions (improving both signal-to-noise ratio and vLLM prefix cache reuse).
+        \item \emph{Rubric-guided JSON reasoning:} Replace the bare leading-\texttt{YES/NO} questions for \texttt{wrong\_data}, \texttt{wrong\_chart}, and \texttt{hard\_to\_read} with explicit operational rubrics adapted from \texttt{ASSIGNMENT.md} (checking values/filtering/ordering against the final script, checking chart type/axes/limits/colormap/legend/labels against every requirement, and inspecting the rendered image for clipping, overlap, occlusion, contrast, and indistinguishability). Require the VLM to first list requirement-by-requirement observations from both the final script and image, and only then emit a structured JSON verdict (\texttt{has\_error: bool} and grounded \texttt{evidence}).
+    \end{itemize}
+\end{enumerate}
+
+\section{Part 2: Improve Your Validator}
+
+\subsection{Implemented Changes}
+Describe the two changes implemented from Part 1. Distinguish deterministic
+checks from model-based checks, where applicable, and explain how each change
+uses the task, trajectory, input data, or rendered figure.
+
+\subsection{Seed-Set Performance vs.\ Baseline}
+Report the modified validator's performance on the seed runs alongside the
+baseline using all four per-family MCC scores and macro-MCC.
+
+\subsection{Qualitative Analysis of Targeted Error Types}
+For each of the two error types surfaced in Part 1, discuss whether the
+corresponding change actually mitigated it, with reference to specific runs.
+Also describe any regressions.
+
+\section{Part 3: Design New Evaluation Tasks}
+
+\subsection{Anticipated Generalization Weaknesses}
+Identify two classes of visualization task that your current validator may
+have trouble generalizing to, and explain why.
+
+\subsection{Task Design}
+Describe the five visualization tasks, including at least two from each
+weakness class. For each task, describe its inputs and data source, expected
+behavior, and why it is a useful stress test for the validator.
+
+\subsection{Agent Runs and Labeling}
+Describe the agents run on the new tasks, the runs generated, and how you
+assigned human labels using the four fixed error families. Explain any
+ambiguous labeling decisions.
+
+\subsection{Validator Performance on New Tasks}
+Report all four per-family MCC scores and macro-MCC on the new agent runs and qualitatively
+analyze important successes, failures, and uncertain labels.
+
+\subsection{Harbor Packaging}
+State that every authored task scores 1.0 against \texttt{-a oracle}; you may
+also report the recommended \texttt{-a nop} runs. Describe both plausible-but-wrong
+mutant solutions and report each reward. For the mutant scoring 0, explain what
+it gets wrong and name the assertion that rejects it. For the mutant scoring
+1.0, explain what it gets wrong and why the verifier accepts it. Then, for each
+of the four error families, say whether a deterministic Harbor verifier for your
+task could decide it, and why or why not. Finally: your validator is graded on
+private runs for tasks you never authored. Explain why a per-task verifier
+cannot serve as that grading mechanism.
+
+\section{Part 4: Iterate on Your Design}
+
+\subsection{Additional Improvement Motivated by Part 3}
+Describe at least one change to the validator motivated by the Part 3 results.
+Identify the observed failure that motivated it and explain why you expected
+the change to help.
+
+\subsection{Final Evaluation on Seed and New Tasks}
+Evaluate the final validator on both the seed runs and self-authored runs.
+Report all four per-family MCC scores and macro-MCC before and after the change on each subset,
+including any regressions.
+
+\subsection{Qualitative Analysis of Self-Authored Tasks}
+Discuss whether the change improved performance on your self-authored tasks,
+with reference to specific runs.
+
+\subsection{Further Changes}
+Report any additional validator changes or tasks beyond the required ones.
+For each, explain its motivation and how successful you judged it to be,
+qualitatively and, for quantitative comparisons, using all four per-family MCC
+scores and macro-MCC.
+
+\end{document}
